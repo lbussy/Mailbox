@@ -35,7 +35,8 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
-#include <iostream>
+#include <iterator>
+#include <vector>
 #include <optional>
 #include <system_error>
 
@@ -77,9 +78,15 @@ Mailbox::Mailbox()
  * Closes the mailbox device if it is currently open, ensuring
  * that resources are released properly.
  */
-Mailbox::~Mailbox()
+Mailbox::~Mailbox() noexcept
 {
-    close();
+    try
+    {
+        close();
+    }
+    catch (...)
+    {
+    }
 }
 
 /**
@@ -120,26 +127,18 @@ void Mailbox::open()
  *
  * @throws std::system_error  If the underlying close() call fails.
  */
-void Mailbox::close()
+void Mailbox::close() noexcept
 {
     if (fd_ < 0)
-        return; // Already closed
+        return;
 
-    if (::close(fd_) < 0)
-    {
-        if (errno != EBADF)
-        {
-            // Only treat errors other than not open as fatal
-            int err = errno;
-            throw std::system_error(
-                err,
-                std::generic_category(),
-                std::string("Mailbox::close(): failed to close ") + DEVICE_FILE_NAME);
-        }
-        // EBADF: Aomebody else closed it, we’ll just drop it
-    }
-
+    const int fd_to_close = fd_;
     fd_ = -1;
+
+    if (::close(fd_to_close) < 0)
+    {
+        // Best-effort cleanup only; never throw from close().
+    }
 }
 
 /**
@@ -340,107 +339,46 @@ uint32_t Mailbox::memUnlock(uint32_t handle)
  * @return A pointer to the mapped memory region, adjusted by the page offset.
  * @throws std::system_error if opening `/dev/mem` or the mmap operation fails.
  */
-volatile uint8_t *Mailbox::mapMem(uint32_t base, size_t size)
+volatile uint8_t *Mailbox::mapMem(std::uintptr_t base, size_t size)
 {
-    if (debug)
-    {
-        std::cerr
-            << debug_tag
-            << "[mapMem] Called with base=0x"
-            << std::hex
-            << base
-            << " size=0x"
-            << size
-            << std::dec
-            << std::endl;
-    }
+    // mapMem() uses /dev/mem. It does not depend on /dev/vcio.
+    const std::size_t offset = static_cast<std::size_t>(base % PAGE_SIZE);
+    const std::uintptr_t aligned_base = base - offset;
 
-    if (fd_ < 0)
-    {
-        if (debug)
-        {
-            std::cerr
-                << debug_tag
-                << "[mapMem] ERROR: fd_ is invalid, mailbox not open"
-                << std::endl;
+    const std::size_t map_len = size + offset;
+    if (map_len < size)
+        throw std::runtime_error("Mailbox::mapMem(): size overflow");
 
-        }
-        throw std::logic_error("mapMem(): Mailbox not open.");
-    }
-
-    const unsigned offset = base % PAGE_SIZE;
-    const off_t aligned_base = base - offset;
-
-    if (debug)
-    {
-        std::cerr
-            << debug_tag
-            << "[mapMem] aligned_base=0x"
-            << std::hex
-            << aligned_base
-            << " offset=0x"
-            << offset
-            << std::dec
-            << std::endl;
-    }
+    const off_t aligned_base_off = static_cast<off_t>(aligned_base);
 
     int mem_fd = ::open(MEM_FILE_NAME, O_RDWR | O_SYNC);
     if (mem_fd < 0)
     {
-        int e = errno;
-        if (debug)
-        {
-            std::cerr
-                << debug_tag
-                << "[mapMem] ERROR: Failed to open /dev/mem: "
-                << strerror(e)
-                << std::endl;
-        }
+        const int e = errno;
         throw std::system_error(
-            e, std::generic_category(),
-            std::string("mapMem(): cannot open ") + MEM_FILE_NAME);
+            e,
+            std::generic_category(),
+            std::string("Mailbox::mapMem(): cannot open ") + MEM_FILE_NAME);
     }
 
-    if (debug)
-    {
-        std::cerr
-            << debug_tag
-            << "[mapMem] /dev/mem opened, fd="
-            << mem_fd
-            << std::endl;
-    }
+    void *mapped = ::mmap(
+        nullptr,
+        map_len,
+        PROT_READ | PROT_WRITE,
+        MAP_SHARED,
+        mem_fd,
+        aligned_base_off);
 
-    void *mapped = ::mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, mem_fd, aligned_base);
     ::close(mem_fd);
 
     if (mapped == MAP_FAILED)
     {
-        int e = errno;
-        if (debug)
-        {
-            std::cerr
-                << debug_tag
-                << "[mapMem] ERROR: mmap failed: "
-                << strerror(e)
-                << std::endl;
-        }
-        throw std::system_error(e, std::generic_category(), "mapMem(): mmap failed");
+        const int e = errno;
+        throw std::system_error(
+            e, std::generic_category(), "Mailbox::mapMem(): mmap failed");
     }
 
-    void *adjusted = static_cast<uint8_t *>(mapped) + offset;
-
-    if (debug)
-    {
-        std::cerr
-            << debug_tag
-            << "[mapMem] mmap succeeded. mapped="
-            << mapped
-            << ", adjusted="
-            << adjusted
-            << std::endl;
-    }
-
-    return static_cast<volatile uint8_t *>(adjusted);
+    return static_cast<volatile uint8_t *>(mapped) + offset;
 }
 
 /**
@@ -456,22 +394,19 @@ volatile uint8_t *Mailbox::mapMem(uint32_t base, size_t size)
  */
 void Mailbox::unMapMem(volatile uint8_t *addr, size_t size)
 {
-    if (fd_ < 0)
-        throw std::logic_error("unMapMem(): Mailbox not open.");
-
-    // Compute the original mapping base by stripping the page‐offset
-    auto addr_val = reinterpret_cast<std::uintptr_t>(addr);
-    const std::size_t offset = addr_val % PAGE_SIZE;
+    const std::uintptr_t addr_val = reinterpret_cast<std::uintptr_t>(addr);
+    const std::size_t offset = static_cast<std::size_t>(addr_val % PAGE_SIZE);
     void *base = reinterpret_cast<void *>(addr_val - offset);
 
-    // Unmap and throw on failure
-    if (::munmap(base, size) != 0)
+    const std::size_t map_len = size + offset;
+    if (map_len < size)
+        throw std::runtime_error("Mailbox::unMapMem(): size overflow");
+
+    if (::munmap(base, map_len) != 0)
     {
-        int e = errno;
+        const int e = errno;
         throw std::system_error(
-            e,
-            std::generic_category(),
-            "Mailbox::unMapMem(): munmap failed");
+            e, std::generic_category(), "Mailbox::unMapMem(): munmap failed");
     }
 }
 
@@ -487,12 +422,58 @@ void Mailbox::unMapMem(volatile uint8_t *addr, size_t size)
  */
 uint32_t Mailbox::discoverPeripheralBase()
 {
-    uint32_t base = 0x20000000;
+    // The device-tree soc/ranges property is stored as big-endian cells.
+    // Common layouts:
+    // - 3x u32: <bus phys size>
+    // - 6x u32: <bus_hi bus_lo phys_hi phys_lo size_hi size_lo>
+
+    constexpr uint32_t fallback = 0x20000000;
+
+    std::ifstream f("/proc/device-tree/soc/ranges", std::ios::binary);
+    if (!f)
+        return fallback;
+
+    std::vector<unsigned char> buf(
+        (std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+
+    auto rd_be_u32 = [&](std::size_t off) -> std::optional<uint32_t>
+    {
+        if (off + 4 > buf.size())
+            return std::nullopt;
+
+        uint32_t be = 0;
+        be |= static_cast<uint32_t>(buf[off + 0]) << 24;
+        be |= static_cast<uint32_t>(buf[off + 1]) << 16;
+        be |= static_cast<uint32_t>(buf[off + 2]) << 8;
+        be |= static_cast<uint32_t>(buf[off + 3]) << 0;
+        return be;
+    };
+
+    if (buf.size() >= 24)
+    {
+        auto phys_hi = rd_be_u32(8);
+        auto phys_lo = rd_be_u32(12);
+        if (phys_hi && phys_lo)
+        {
+            if (*phys_hi == 0 && *phys_lo != 0)
+                return *phys_lo;
+        }
+    }
+
+    if (buf.size() >= 12)
+    {
+        auto phys = rd_be_u32(4);
+        if (phys && *phys != 0)
+            return *phys;
+    }
+
+    // Fallback to the older helper offsets if present.
     if (auto v = read_dt_range_helper("/proc/device-tree/soc/ranges", 4); v && *v)
-        base = *v;
-    else if (auto v = read_dt_range_helper("/proc/device-tree/soc/ranges", 8); v)
-        base = *v;
-    return base;
+        return *v;
+    if (auto v = read_dt_range_helper("/proc/device-tree/soc/ranges", 8); v && *v)
+        return *v;
+
+    return fallback;
 }
 
 /**

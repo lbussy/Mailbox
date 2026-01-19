@@ -31,6 +31,7 @@
 #pragma once
 
 // C++ Standard Library
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <stdexcept>
@@ -56,7 +57,7 @@ public:
      * Closes the mailbox device if it is currently open, ensuring
      * that resources are released properly.
      */
-    ~Mailbox();
+    ~Mailbox() noexcept;
 
     /**
      * @brief Opens the mailbox device.
@@ -73,234 +74,104 @@ public:
      * @brief Closes the mailbox device.
      *
      * If the mailbox file descriptor is valid, attempts to close it.
-     * If the underlying close() call fails, throws a system_error with the
-     * errno and a descriptive message. After successful close, the internal
-     * file descriptor is reset to -1.
      *
-     * @throws std::system_error  If the underlying close() call fails.
+     * This function is noexcept so it can be safely called from the destructor.
      */
-    void close();
+    void close() noexcept;
 
     /**
      * @brief Get the underlying mailbox file descriptor.
      *
-     * @return The file descriptor obtained via `open()`, or -1 if the mailbox is closed.
+     * @return The file descriptor obtained via `open()`, or -1 if the mailbox
+     *         is closed.
      */
     [[nodiscard]] int getFD() const noexcept { return fd_; }
 
-    /**
-     * @brief Allocate GPU-accessible memory via the mailbox property interface.
-     *
-     * Constructs and sends a mailbox property message to request a memory allocation
-     * of the specified size and alignment, using flags determined by the current
-     * Raspberry Pi hardware revision.
-     *
-     * @param size  Number of bytes to allocate.
-     * @param align Alignment constraint in bytes (power-of-two).
-     * @return A handle (uint32_t) identifying the allocated memory block.
-     * @throws std::system_error if the ioctl to the mailbox device fails.
-     */
     [[nodiscard]] uint32_t memAlloc(uint32_t size, uint32_t align);
-
-    /**
-     * @brief Free previously allocated GPU memory via the mailbox property interface.
-     *
-     * Constructs and sends a mailbox property message to release a memory block
-     * identified by the given handle.
-     *
-     * @param handle Handle returned by a prior call to memAlloc().
-     * @return Result code from the mailbox property response (non-zero indicates success).
-     * @throws std::system_error if the ioctl to the mailbox device fails.
-     */
     uint32_t memFree(uint32_t handle);
-
-    /**
-     * @brief Lock a previously allocated GPU memory block to obtain its bus address.
-     *
-     * Constructs and sends a mailbox property message to lock a memory block
-     * identified by the given handle, returning its bus address for DMA use.
-     *
-     * @param handle Handle returned by a prior call to memAlloc().
-     * @return Physical (bus) address of the locked memory block.
-     * @throws std::system_error if the ioctl to the mailbox device fails.
-     */
     [[nodiscard]] std::uintptr_t memLock(uint32_t handle);
-
-    /**
-     * @brief Unlock a previously locked GPU memory block.
-     *
-     * Constructs and sends a mailbox property message to unlock a memory block
-     * identified by the given handle, allowing it to be freed or reallocated.
-     *
-     * @param handle Handle returned by memAlloc() and previously passed to memLock().
-     * @return Result code: non-zero indicates success.
-     * @throws std::system_error if the ioctl to the mailbox device fails.
-     */
     uint32_t memUnlock(uint32_t handle);
 
     /**
-     * @brief Map a physical bus address range into user-space memory.
+     * @brief Map a physical address range into user-space memory.
      *
-     * Opens `/dev/mem`, aligns the requested `base` address to the system page size,
-     * and mmaps a region of length `size` bytes. The returned pointer is offset
-     * by the original `base % PAGE_SIZE` so that it points directly at the requested
-     * bus address.
+     * Opens `/dev/mem`, aligns the requested `base` address to the system page
+     * size, and mmaps a region of length `size` bytes. The returned pointer is
+     * offset by the original `base % PAGE_SIZE` so that it points directly at
+     * the requested address.
      *
-     * @param base The bus address to map; will be aligned down to a PAGE_SIZE boundary.
-     * @param size The number of bytes to map.
-     * @return A pointer to the mapped memory region, adjusted by the page offset.
-     * @throws std::system_error if opening `/dev/mem` or the mmap operation fails.
+     * Note: The internal mapping length is `size + offset` so that the returned
+     * pointer always has at least `size` bytes of valid space.
+     *
+     * @param base Physical address to map; will be aligned down to a PAGE_SIZE
+     *             boundary.
+     * @param size Number of bytes to map starting at `base`.
+     * @return Pointer to mapped region, adjusted by the page offset.
+     * @throws std::system_error if opening `/dev/mem` or mmap fails.
      */
-    [[nodiscard]] volatile uint8_t *mapMem(uint32_t base, size_t size);
+    [[nodiscard]] volatile uint8_t *mapMem(std::uintptr_t base, std::size_t size);
 
     /**
-     * @brief Unmap a previously mapped bus address region.
+     * @brief Unmap a previously mapped address region.
      *
-     * Calculates the original mapping base by removing the page offset
-     * from the pointer returned by mapMem(), then calls munmap() to
-     * release the mapping.
+     * Calculates the original mapping base by removing the page offset from the
+     * pointer returned by mapMem(), then calls munmap() to release the mapping.
      *
-     * @param addr Pointer returned by mapMem(), adjusted into the mapped region.
-     * @param size The number of bytes that were mapped (same size passed to mapMem()).
-     * @throws std::system_error if munmap() fails.
+     * Note: This unmaps `size + offset` to match mapMem().
+     *
+     * @param addr Pointer returned by mapMem().
+     * @param size Size passed to mapMem().
+     * @throws std::system_error if munmap fails.
      */
-    void unMapMem(volatile uint8_t *addr, size_t size);
+    void unMapMem(volatile uint8_t *addr, std::size_t size);
 
     /**
      * @brief Determine the SoC peripheral base address from the device tree.
      *
-     * Reads the 4-byte big-endian values at offsets 4 and 8 in
-     * `/proc/device-tree/soc/ranges` to discover the GPU peripheral bus base.
-     * If neither entry is present or nonzero, falls back to the legacy
-     * address 0x2000'0000.
+     * Attempts to parse `/proc/device-tree/soc/ranges` in common 32-bit and
+     * 64-bit cell formats. Returns the physical peripheral base suitable for
+     * mapping via `/dev/mem`.
      *
-     * @return The bus-addressable peripheral base to use for mmap offsets.
+     * If parsing fails, falls back to the legacy address 0x2000'0000.
+     *
+     * @return Physical peripheral base address.
      */
     [[nodiscard]] static uint32_t discoverPeripheralBase();
 
-    /**
-     * @brief Convert a bus address into its underlying physical address.
-     *
-     * This function clears the high-order flag bits (as defined by BUS_FLAG_MASK)
-     * from a bus address, yielding the raw physical memory address.
-     *
-     * @param x The bus address, potentially containing caching/alias flags.
-     * @return The physical address with flag bits masked off.
-     */
     [[nodiscard]] static constexpr std::uintptr_t
     busToPhysical(std::uintptr_t x) noexcept
     {
         return x & ~BUS_FLAG_MASK;
     }
 
-    /**
-     * @brief Compute the offset of a bus address from the peripheral base.
-     *
-     * This function subtracts the constant PERIPH_BUS_BASE from the given bus
-     * address to obtain the byte offset within the mapped peripheral region.
-     *
-     * @param x The bus address to offset.
-     * @return The offset (in bytes) from the peripheral base address.
-     */
     [[nodiscard]] static constexpr std::uintptr_t
     offsetFromBase(std::uintptr_t x) noexcept
     {
         return x - PERIPH_BUS_BASE;
     }
 
-    /**
-     * @brief Mask of the high bits in a 32-bit bus address that indicate
-     *       caching flags.
-     */
     static constexpr std::uintptr_t BUS_FLAG_MASK = 0xC0000000ULL;
-
-    /**
-     * @brief Base bus address for peripheral registers (to compute offsets
-     *       into the mapped window).
-     */
     static constexpr std::uintptr_t PERIPH_BUS_BASE = 0x7E000000ULL;
-
-    /**
-     * @brief Standard page size (4 KiB) for mailbox allocations.
-     */
-    static constexpr size_t PAGE_SIZE = 4 * 1024;
-
-    /**
-     * @brief Standard block size (4 KiB) for mailbox allocations (same as
-     *        PAGE_SIZE).
-     */
-    static constexpr size_t BLOCK_SIZE = 4 * 1024;
+    static constexpr std::size_t PAGE_SIZE = 4 * 1024;
+    static constexpr std::size_t BLOCK_SIZE = 4 * 1024;
 
 private:
-    /**
-     * @brief Major device number for the mailbox property interface on newer kernels (>= 4.1).
-     */
     static inline constexpr int MAJOR_NUM_A = 249;
-
-    /**
-     * @brief Major device number for the mailbox property interface on older kernels.
-     */
     static inline constexpr int MAJOR_NUM_B = 100;
+    static inline constexpr int IOCTL_MBOX_PROPERTY =
+        _IOWR(MAJOR_NUM_B, 0, char *);
 
-    /**
-     * @brief IOCTL command code for the mailbox property interface.
-     *
-     * Builds a read-write IOCTL with major number MAJOR_NUM_B and command 0.
-     */
-    static inline constexpr int IOCTL_MBOX_PROPERTY = _IOWR(MAJOR_NUM_B, 0, char *);
-
-    /**
-     * @brief Path to the mailbox character device.
-     *
-     * Used by open() to open `/dev/vcio`.
-     */
     static inline constexpr char DEVICE_FILE_NAME[] = "/dev/vcio";
-
-    /**
-     * @brief Path to the raw memory device.
-     *
-     * Used by mapMem() to open `/dev/mem` for physical memory mapping.
-     */
     static inline constexpr char MEM_FILE_NAME[] = "/dev/mem";
 
-    /**
-     * @brief File descriptor for the opened mailbox device.
-     *
-     * Initialized to -1 to indicate that the mailbox is not currently open.
-     */
     int fd_ = -1;
 
-    /**
-     * @brief Determine the mailbox mem_flag based on Pi hardware revision.
-     *
-     * Reads `/proc/cpuinfo` (cached on first call), extracts the processor ID,
-     * and returns 0x0C for BCM2835 (Pi 1) or 0x04 for later models (Pi 2/3/4).
-     *
-     * @return The mem_flag to pass into memAlloc().
-     * @throws std::runtime_error on an unrecognized chipset.
-     */
     [[nodiscard]] uint32_t get_mem_flag();
 
-    /**
-     * @brief Read a 32-bit big-endian value from a device-tree file at a given offset.
-     *
-     * Opens the binary file at `path`, seeks to `offset`, and reads four bytes.
-     * Converts from big-endian on-disk format to host endianness.
-     *
-     * @param path   Filesystem path to the device-tree binary file.
-     * @param offset Byte offset within the file to read from.
-     * @return A `std::optional<uint32_t>` containing the converted value on success,
-     *         or `std::nullopt` if the file cannot be opened or the read fails.
-     */
-    static std::optional<uint32_t> read_dt_range_helper(const char *path, std::size_t offset);
+    static std::optional<uint32_t>
+    read_dt_range_helper(const char *path, std::size_t offset);
 };
 
-/**
- * @brief Global instance of the Broadcom Mailbox interface shim.
- *
- * Provides a single, shared `Mailbox` object for opening/closing the mailbox,
- * allocating/freeing GPU memory, and mapping/unmapping physical address ranges.
- */
 extern Mailbox mailbox;
 
 #endif // _MAILBOX_HPP
