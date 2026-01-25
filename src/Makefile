@@ -28,7 +28,7 @@
 DEBUG := -DDEBUG_MAILBOX
 
 # C++ Version
-CXXVER := 17
+CXXVER := 20
 
 # "sudo" prefix for executing tests, uncomment if required
 SUDO := sudo

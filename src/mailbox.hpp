@@ -1,6 +1,6 @@
 /**
  * @file mailbox.hpp
- * @brief C++17 `Mailbox` class to interface with the Broadcom GPU mailbox.
+ * @brief C++20 `Mailbox` class to interface with the Broadcom GPU mailbox.
  *
  * This project is is licensed under the MIT License. See LICENSE.md
  * for more information.

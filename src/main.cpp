@@ -1,6 +1,6 @@
 /**
  * @file main.cpp
- * @brief A test harness for the C++17 `Mailbox` class to interface with the
+ * @brief A test harness for the C++20 `Mailbox` class to interface with the
  *        Broadcom GPU mailbox.
  *
  * This project is is licensed under the MIT License. See LICENSE.md
