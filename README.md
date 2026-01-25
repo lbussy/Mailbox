@@ -17,7 +17,7 @@ A **modern C++17** implementation of the Raspberry Pi GPU mailbox interface—p
 
    ```bash
    cd your-project
-   git submodule add https://github.com/lbussy/Broadcom-Mailbox.git extern/Broadcom-Mailbox
+   git submodule add https://github.com/WsprryPi/Broadcom-Mailbox.git extern/Broadcom-Mailbox
    git submodule update --init --recursive
    ```
 
